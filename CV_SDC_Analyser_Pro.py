@@ -54,6 +54,17 @@ def point_sort_key(name):
     return (int(m.group(1)) if m else 10**9, name)
 
 
+def point_label(name):
+    """Human label 'Point N' from a filename containing a number, else the name."""
+    m = re.search(r"(\d+)", name)
+    return f"Point {m.group(1)}" if m else name
+
+
+def safe_key(text):
+    """Alphanumeric-only key safe for HTML ids and Streamlit element keys."""
+    return re.sub(r"[^0-9a-zA-Z]", "", str(text))
+
+
 @st.cache_data(show_spinner=False)
 def load_excel(file_bytes, sheet_name):
     return pd.read_excel(io.BytesIO(file_bytes), sheet_name=sheet_name)
@@ -304,9 +315,7 @@ refresh();
 """
     html = (html.replace("__PAYLOAD__", payload)
                 .replace("__HEIGHT__", str(key_height))
-                .replace("_K", "_" + dom_key)
-                .replace("toolbar_K", "toolbar_" + dom_key)
-                .replace("out_K", "out_" + dom_key))
+                .replace("_K", "_" + dom_key))
     components.html(html, height=key_height + 130, scrolling=False)
 
 
@@ -314,15 +323,14 @@ refresh();
 # Per-file analysis (all the original features for one file)
 # ----------------------------------------------------------------------------
 
-def analyse_file(work, pot_col, cur_col, color_offset=0):
-    """Render the full single-file analysis and return the per-scan summary df."""
+def analyse_file(work, pot_col, cur_col, view_key):
+    """Render the full single-file analysis. view_key makes element keys unique."""
     scans = list(work["scan"].unique())
     try:
         scans = sorted(scans, key=lambda s: float(s))
     except (ValueError, TypeError):
         scans = sorted(scans)
-    color_map = {s: PALETTE[(i + color_offset) % len(PALETTE)]
-                 for i, s in enumerate(scans)}
+    color_map = {s: PALETTE[i % len(PALETTE)] for i, s in enumerate(scans)}
     unit_label = "C"
 
     # Combined plot
@@ -340,7 +348,7 @@ def analyse_file(work, pot_col, cur_col, color_offset=0):
         legend=dict(title="Scan"), margin=dict(l=60, r=20, t=20, b=50),
         template="plotly_white", hovermode="closest",
     )
-    st.plotly_chart(fig, use_container_width=True)
+    st.plotly_chart(fig, use_container_width=True, key=f"combined_{view_key}")
 
     # Peak tables
     st.subheader("Peak current / voltage per scan")
@@ -394,7 +402,7 @@ def analyse_file(work, pot_col, cur_col, color_offset=0):
             continue
         x1 = float(sub["potential"].min()); y1 = 0.0
         x2 = float(sub["potential"].max()); y2 = 0.0
-        dom_key = re.sub(r"[^0-9a-zA-Z]", "", f"{st.session_state.get('_view_key','')}{s}")
+        dom_key = safe_key(f"{view_key}{s}")
         with st.expander(f"Scan {s}", expanded=(s == scans[0])):
             st.markdown(f"#### Scan {s}")
             draggable_cv_component(
@@ -439,7 +447,7 @@ def analyse_file(work, pot_col, cur_col, color_offset=0):
         "Download charge summary (CSV)",
         summary.to_csv(index=False).encode("utf-8"),
         file_name="cv_charge_summary.csv", mime="text/csv",
-        key=f"dl_{st.session_state.get('_view_key','')}",
+        key=f"dl_{view_key}",
     )
 
     # Trend-vs-scan plots
@@ -475,12 +483,40 @@ def analyse_file(work, pot_col, cur_col, color_offset=0):
     ]
     for i in range(0, len(trends), 2):
         ccols = st.columns(2)
-        for col, (title, ydata, ytitle, color) in zip(ccols, trends[i:i + 2]):
+        for j, (col, (title, ydata, ytitle, color)) in enumerate(zip(ccols, trends[i:i + 2])):
             with col:
                 st.markdown(f"**{title}**")
                 st.plotly_chart(trend_chart(ydata, ytitle, color),
-                                use_container_width=True)
+                                use_container_width=True,
+                                key=f"trend_{view_key}_{i}_{j}")
     return summary
+
+
+def per_scan_summary_silent(work):
+    """Compute the per-scan metrics for a file WITHOUT rendering anything.
+    Used for the point-wise comparison (default Y = 0 baseline)."""
+    scans = list(work["scan"].unique())
+    try:
+        scans = sorted(scans, key=lambda s: float(s))
+    except (ValueError, TypeError):
+        scans = sorted(scans)
+    rows = []
+    for s in scans:
+        sub = work[work["scan"] == s].reset_index(drop=True)
+        if len(sub) < 2:
+            continue
+        i_max = sub["current"].idxmax()
+        i_min = sub["current"].idxmin()
+        bl = np.full(len(sub), 0.0)  # default Y = 0 baseline
+        pos_area, neg_area = trapz_signed(sub["time"].values,
+                                          sub["current"].values, bl)
+        rows.append({
+            "Anodic peak I (A)": float(sub.loc[i_max, "current"]),
+            "Cathodic peak I (A)": float(sub.loc[i_min, "current"]),
+            "Positive charge (C)": pos_area,
+            "Negative charge (C)": neg_area,
+        })
+    return pd.DataFrame(rows)
 
 
 def representative_metrics(summary, mode):
@@ -544,8 +580,7 @@ with st.sidebar:
     selected_name = st.selectbox("Select file to analyse", file_names, index=0)
 
     st.header("3 · Columns")
-    sample = file_by_name[selected_name]
-    sample_bytes = sample.getvalue()
+    sample_bytes = file_by_name[selected_name].getvalue()
     sheets = list_sheets(sample_bytes)
     sheet = st.selectbox("Sheet (applied to all files)", sheets, index=0)
     cols = list(load_excel(sample_bytes, sheet).columns)
@@ -583,14 +618,14 @@ def prepare(file_obj):
 # ----------------------------------------------------------------------------
 
 st.markdown(f"## Analysis: {selected_name}")
-st.session_state["_view_key"] = re.sub(r"[^0-9a-zA-Z]", "", selected_name)
+view_key = safe_key(selected_name)
 
 work = prepare(file_by_name[selected_name])
 if work is None or work.empty:
     st.error(f"'{selected_name}' is missing one of the required columns "
              f"({pot_col}, {cur_col}, {scan_col}, {time_col}) or has no valid rows.")
 else:
-    analyse_file(work, pot_col, cur_col)
+    analyse_file(work, pot_col, cur_col, view_key)
 
 # ----------------------------------------------------------------------------
 # Point-wise comparison across all files
@@ -600,7 +635,8 @@ st.markdown("---")
 st.header("Point-wise comparison")
 st.caption(
     f"One representative value per file using: **{rep_mode}**. "
-    "Anodic = positive charge, Cathodic = negative charge."
+    "Anodic = positive charge, Cathodic = negative charge. "
+    "Charges use the default Y = 0 baseline."
 )
 
 rows = []
@@ -608,35 +644,11 @@ for name in file_names:
     w = prepare(file_by_name[name])
     if w is None or w.empty:
         continue
-    # compute per-scan summary silently (no rendering) for this file
-    scans = list(w["scan"].unique())
-    try:
-        scans = sorted(scans, key=lambda s: float(s))
-    except (ValueError, TypeError):
-        scans = sorted(scans)
-    s_rows = []
-    for s in scans:
-        sub = w[w["scan"] == s].reset_index(drop=True)
-        if len(sub) < 2:
-            continue
-        i_max = sub["current"].idxmax(); i_min = sub["current"].idxmin()
-        x1 = float(sub["potential"].min()); x2 = float(sub["potential"].max())
-        bl = np.full(len(sub), 0.0)  # default Y = 0 baseline
-        pos_area, neg_area = trapz_signed(sub["time"].values,
-                                          sub["current"].values, bl)
-        s_rows.append({
-            "Anodic peak I (A)": float(sub.loc[i_max, "current"]),
-            "Cathodic peak I (A)": float(sub.loc[i_min, "current"]),
-            "Positive charge (C)": pos_area,
-            "Negative charge (C)": neg_area,
-        })
-    s_df = pd.DataFrame(s_rows)
+    s_df = per_scan_summary_silent(w)
     rep = representative_metrics(s_df, rep_mode)
     if rep is None:
         continue
-    m = re.search(r"(\d+)", name)
-    label = f"Point {m.group(1)}" if m else name
-    rep_row = {"Point": label}
+    rep_row = {"Point": point_label(name)}
     rep_row.update(rep)
     rows.append(rep_row)
 
@@ -649,6 +661,7 @@ else:
         "Download point-wise comparison (CSV)",
         pw.to_csv(index=False).encode("utf-8"),
         file_name="point_wise_comparison.csv", mime="text/csv",
+        key="dl_pointwise",
     )
 
     # six comparison curves
@@ -676,7 +689,8 @@ else:
     ]
     for i in range(0, len(pw_curves), 2):
         ccols = st.columns(2)
-        for col, (metric, color) in zip(ccols, pw_curves[i:i + 2]):
+        for j, (col, (metric, color)) in enumerate(zip(ccols, pw_curves[i:i + 2])):
             with col:
                 st.markdown(f"**{metric} vs point**")
-                st.plotly_chart(pw_chart(metric, color), use_container_width=True)
+                st.plotly_chart(pw_chart(metric, color),
+                                use_container_width=True, key=f"pw_{i}_{j}")
