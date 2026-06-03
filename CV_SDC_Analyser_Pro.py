@@ -5,12 +5,16 @@ Upload MULTIPLE Excel files (name them "point 1" … "point 10"). For each file:
   - Combined CV plot (Potential vs WE(1).Current (A)) coloured by scan.
   - Peak current / voltage tables, ΔEp, draw/drag-baseline per-scan integration
     (Q = ∫ I dt over time, in coulombs), and trend-vs-scan plots.
+  - Peak current vs time for anode & cathode, each fitted to
+        I(t) = C + A*exp(-k*t)
+    where k is the rate constant for surface change. C, A, k and R² are tabled.
 Select which file to view from a dropdown. A final cross-file section gives a
-point-wise summary table and six point-wise comparison curves.
+point-wise summary table, six comparison curves, and a fit-parameter table.
 
 Expected columns:  Potential , WE(1).Current (A) , scan , and a time column.
 
 Run with:  streamlit run cv_app.py
+Requirements: streamlit, pandas, numpy, plotly, openpyxl, scipy
 """
 
 import io
@@ -22,6 +26,7 @@ import plotly.graph_objects as go
 import plotly.express as px
 import streamlit as st
 import streamlit.components.v1 as components
+from scipy.optimize import curve_fit
 
 st.set_page_config(page_title="CV Charge Integration", layout="wide")
 
@@ -78,8 +83,7 @@ def list_sheets(file_bytes):
 def trapz_signed(xvar, current, baseline):
     """Integrate (current - baseline) over xvar (TIME, in seconds); split into
     positive / negative areas. Zero-crossings within a segment are split at the
-    crossing for accuracy. With xvar = time, the result is charge in coulombs.
-    Mirrors the in-browser JS implementation exactly."""
+    crossing for accuracy. With xvar = time, the result is charge in coulombs."""
     X = np.asarray(xvar, dtype=float)
     diff = np.asarray(current, dtype=float) - np.asarray(baseline, dtype=float)
     pos = neg = 0.0
@@ -103,6 +107,103 @@ def trapz_signed(xvar, current, baseline):
 
 
 # ----------------------------------------------------------------------------
+# Exponential decay fit:  I(t) = C + A*exp(-k*t)
+# t is measured from the first peak (t = 0) for numerical stability; this
+# leaves C and k unchanged and only rescales A.
+# ----------------------------------------------------------------------------
+
+def exp_model(t, C, A, k):
+    return C + A * np.exp(-k * t)
+
+
+def fit_exp_decay(t, y):
+    """Fit I(t)=C+A*exp(-k*t). Returns dict with C, A, k, R2, and the t-origin,
+    or None if there are too few points / the fit fails."""
+    t = np.asarray(t, dtype=float)
+    y = np.asarray(y, dtype=float)
+    if len(t) < 4:
+        return None
+    t_min = t.min()
+    t0 = t - t_min                       # t = 0 at first peak
+    span = t0.max() if t0.max() > 0 else 1.0
+    C0 = y[-1]
+    A0 = y[0] - y[-1]
+    k0 = 1.0 / span
+    try:
+        popt, _ = curve_fit(exp_model, t0, y, p0=[C0, A0, k0], maxfev=20000)
+        C, A, k = (float(v) for v in popt)
+        yhat = exp_model(t0, C, A, k)
+        ss_res = float(np.sum((y - yhat) ** 2))
+        ss_tot = float(np.sum((y - np.mean(y)) ** 2))
+        r2 = 1 - ss_res / ss_tot if ss_tot > 0 else float("nan")
+        return {"C": C, "A": A, "k": k, "R2": r2, "t_min": float(t_min)}
+    except Exception:
+        return None
+
+
+def peak_time_series(work):
+    """Per-scan peak times and peak currents for anode & cathode.
+    Returns (anodic_t, anodic_I, cathodic_t, cathodic_I) as numpy arrays,
+    ordered by scan."""
+    scans = list(work["scan"].unique())
+    try:
+        scans = sorted(scans, key=lambda s: float(s))
+    except (ValueError, TypeError):
+        scans = sorted(scans)
+    at, ai, ct, ci = [], [], [], []
+    for s in scans:
+        sub = work[work["scan"] == s]
+        if sub.empty:
+            continue
+        i_max = sub["current"].idxmax()
+        i_min = sub["current"].idxmin()
+        at.append(float(sub.loc[i_max, "time"]))
+        ai.append(float(sub.loc[i_max, "current"]))
+        ct.append(float(sub.loc[i_min, "time"]))
+        ci.append(float(sub.loc[i_min, "current"]))
+    return (np.array(at), np.array(ai), np.array(ct), np.array(ci))
+
+
+def fit_plot(t, y, fit, title, color, key):
+    """Scatter of peak current vs (time since first peak) with fitted curve."""
+    f = go.Figure()
+    if len(t):
+        t_rel = t - t.min()
+        f.add_trace(go.Scatter(
+            x=t_rel, y=y, mode="markers", name="Peak current",
+            marker=dict(size=9, color=color),
+            hovertemplate="t=%{x:.1f} s<br>I=%{y:.4g} A<extra></extra>",
+        ))
+        if fit is not None:
+            tt = np.linspace(t_rel.min(), t_rel.max(), 200)
+            yy = exp_model(tt, fit["C"], fit["A"], fit["k"])
+            f.add_trace(go.Scatter(
+                x=tt, y=yy, mode="lines", name="C + A·exp(−k·t)",
+                line=dict(color="black", width=2, dash="dash"),
+                hoverinfo="skip",
+            ))
+    f.update_layout(
+        xaxis_title="Time since first peak (s)", yaxis_title="Peak current (A)",
+        height=360, margin=dict(l=70, r=20, t=30, b=45),
+        template="plotly_white",
+        legend=dict(orientation="h", yanchor="bottom", y=1.02, xanchor="right", x=1),
+    )
+    st.markdown(f"**{title}**")
+    st.plotly_chart(f, use_container_width=True, key=key)
+
+
+def fit_params_table(anod_fit, cath_fit):
+    """Build a small dataframe of fit parameters for anodic & cathodic."""
+    def row(label, fit):
+        if fit is None:
+            return {"Region": label, "C": np.nan, "A": np.nan,
+                    "k (rate constant, 1/s)": np.nan, "R²": np.nan}
+        return {"Region": label, "C": fit["C"], "A": fit["A"],
+                "k (rate constant, 1/s)": fit["k"], "R²": fit["R2"]}
+    return pd.DataFrame([row("Anodic", anod_fit), row("Cathodic", cath_fit)])
+
+
+# ----------------------------------------------------------------------------
 # Draw/drag-baseline component (HTML + Plotly.js)
 # ----------------------------------------------------------------------------
 
@@ -110,15 +211,14 @@ def draggable_cv_component(potential, current, time, color, x_title, y_title,
                            default_x1, default_y1, default_x2, default_y2,
                            dom_key, key_height=440):
     """Render a Plotly chart (Potential X vs Current Y) with a draw/drag linear
-    baseline. Charge is integrated over TIME -> coulombs, live in the browser.
-    dom_key keeps element IDs unique when several components share a page."""
+    baseline. Charge is integrated over TIME -> coulombs, live in the browser."""
     P = [float(v) for v in potential]
     I = [float(v) for v in current]
     T = [float(v) for v in time]
 
     pmin, pmax = min(P), max(P)
     imin, imax = min(I), max(I)
-    imin = min(imin, 0.0)   # ensure Y=0 baseline is always within view
+    imin = min(imin, 0.0)
     imax = max(imax, 0.0)
     px_pad = (pmax - pmin) * 0.05 or 0.01
     iy_pad = (imax - imin) * 0.10 or abs(imax) * 0.1 or 1e-9
@@ -324,7 +424,6 @@ refresh();
 # ----------------------------------------------------------------------------
 
 def analyse_file(work, pot_col, cur_col, view_key):
-    """Render the full single-file analysis. view_key makes element keys unique."""
     scans = list(work["scan"].unique())
     try:
         scans = sorted(scans, key=lambda s: float(s))
@@ -350,7 +449,7 @@ def analyse_file(work, pot_col, cur_col, view_key):
     )
     st.plotly_chart(fig, use_container_width=True, key=f"combined_{view_key}")
 
-    # Peak tables
+    # Peak tables (also captures peak times for the exp-fit section)
     st.subheader("Peak current / voltage per scan")
     st.caption(
         "Positive region = maximum (anodic) current; Negative region = minimum "
@@ -365,19 +464,19 @@ def analyse_file(work, pot_col, cur_col, view_key):
             continue
         i_max = sub["current"].idxmax()
         i_min = sub["current"].idxmin()
-        v_anodic = float(sub.loc[i_max, "potential"])
-        i_anodic = float(sub.loc[i_max, "current"])
-        v_cathodic = float(sub.loc[i_min, "potential"])
-        i_cathodic = float(sub.loc[i_min, "current"])
         peak_metrics[s] = {
-            "v_anodic": v_anodic, "i_anodic": i_anodic,
-            "v_cathodic": v_cathodic, "i_cathodic": i_cathodic,
-            "dEp": v_anodic - v_cathodic,
+            "v_anodic": float(sub.loc[i_max, "potential"]),
+            "i_anodic": float(sub.loc[i_max, "current"]),
+            "t_anodic": float(sub.loc[i_max, "time"]),
+            "v_cathodic": float(sub.loc[i_min, "potential"]),
+            "i_cathodic": float(sub.loc[i_min, "current"]),
+            "t_cathodic": float(sub.loc[i_min, "time"]),
         }
-        pos_rows.append({"Scan": s, "Peak Current (A)": i_anodic,
-                         "Peak Voltage (V)": v_anodic})
-        neg_rows.append({"Scan": s, "Peak Current (A)": i_cathodic,
-                         "Peak Voltage (V)": v_cathodic})
+        peak_metrics[s]["dEp"] = peak_metrics[s]["v_anodic"] - peak_metrics[s]["v_cathodic"]
+        pos_rows.append({"Scan": s, "Peak Current (A)": peak_metrics[s]["i_anodic"],
+                         "Peak Voltage (V)": peak_metrics[s]["v_anodic"]})
+        neg_rows.append({"Scan": s, "Peak Current (A)": peak_metrics[s]["i_cathodic"],
+                         "Peak Voltage (V)": peak_metrics[s]["v_cathodic"]})
     c1, c2 = st.columns(2)
     with c1:
         st.markdown("**Positive region (anodic peak)**")
@@ -489,12 +588,35 @@ def analyse_file(work, pot_col, cur_col, view_key):
                 st.plotly_chart(trend_chart(ydata, ytitle, color),
                                 use_container_width=True,
                                 key=f"trend_{view_key}_{i}_{j}")
+
+    # Peak current vs time with exponential fit  I(t) = C + A*exp(-k*t)
+    st.subheader("Peak current vs time — exponential fit  I(t) = C + A·exp(−k·t)")
+    st.caption(
+        "k is the **rate constant for surface change**. Time is measured from "
+        "the first peak (t = 0). Fit by non-linear least squares."
+    )
+    at, ai, ct, ci = peak_time_series(work)
+    anod_fit = fit_exp_decay(at, ai)
+    cath_fit = fit_exp_decay(ct, ci)
+    fc1, fc2 = st.columns(2)
+    with fc1:
+        fit_plot(at, ai, anod_fit, "Anodic peak current vs time", "#d62728",
+                 key=f"fit_anod_{view_key}")
+    with fc2:
+        fit_plot(ct, ci, cath_fit, "Cathodic peak current vs time", "#1f77b4",
+                 key=f"fit_cath_{view_key}")
+    ptbl = fit_params_table(anod_fit, cath_fit)
+    st.markdown("**Fitted parameters**")
+    st.dataframe(ptbl, use_container_width=True, hide_index=True)
+    if anod_fit is None or cath_fit is None:
+        st.caption("Note: a fit is shown only when a region has at least 4 scans "
+                   "and the optimisation converges.")
+
     return summary
 
 
 def per_scan_summary_silent(work):
-    """Compute the per-scan metrics for a file WITHOUT rendering anything.
-    Used for the point-wise comparison (default Y = 0 baseline)."""
+    """Per-scan metrics for a file WITHOUT rendering (default Y = 0 baseline)."""
     scans = list(work["scan"].unique())
     try:
         scans = sorted(scans, key=lambda s: float(s))
@@ -507,7 +629,7 @@ def per_scan_summary_silent(work):
             continue
         i_max = sub["current"].idxmax()
         i_min = sub["current"].idxmin()
-        bl = np.full(len(sub), 0.0)  # default Y = 0 baseline
+        bl = np.full(len(sub), 0.0)
         pos_area, neg_area = trapz_signed(sub["time"].values,
                                           sub["current"].values, bl)
         rows.append({
@@ -520,7 +642,6 @@ def per_scan_summary_silent(work):
 
 
 def representative_metrics(summary, mode):
-    """Collapse a per-scan summary to one representative row per the chosen mode."""
     if summary.empty:
         return None
     pos_col = [c for c in summary.columns if c.startswith("Positive charge")][0]
@@ -529,20 +650,19 @@ def representative_metrics(summary, mode):
         row = summary.iloc[0]
     elif mode == "Mean across scans":
         row = summary.mean(numeric_only=True)
-    else:  # Last scan (steady state)
+    else:
         row = summary.iloc[-1]
     anodic_I = float(row["Anodic peak I (A)"])
     cathodic_I = float(row["Cathodic peak I (A)"])
     anodic_Q = float(row[pos_col])
     cathodic_Q = float(row[neg_col])
-    net_Q = anodic_Q + cathodic_Q
     ratio = abs(cathodic_Q / anodic_Q) if anodic_Q != 0 else float("nan")
     return {
         "Peak Anodic Current (A)": anodic_I,
         "abs(Peak Cathodic Current) (A)": abs(cathodic_I),
         "Anodic charge (C)": anodic_Q,
         "Cathodic charge (C)": cathodic_Q,
-        "Net charge (C)": net_Q,
+        "Net charge (C)": anodic_Q + cathodic_Q,
         "abs(Cathodic/Anodic charge) ratio": ratio,
     }
 
@@ -570,7 +690,6 @@ if not uploads:
             "Name the files 'point 1' … 'point 10' for identification.")
     st.stop()
 
-# order files by the number in their name
 files = sorted(uploads, key=lambda f: point_sort_key(f.name))
 file_names = [f.name for f in files]
 file_by_name = {f.name: f for f in files}
@@ -591,7 +710,7 @@ with st.sidebar:
     pot_col = st.selectbox("Potential (X)", cols, index=cols.index(pot_guess))
     cur_col = st.selectbox("Current (Y)", cols, index=cols.index(cur_guess))
     scan_col = st.selectbox("Scan / Cycle", cols, index=cols.index(scan_guess))
-    time_col = st.selectbox("Time (s) — for charge integration", cols,
+    time_col = st.selectbox("Time (s) — for charge integration & fits", cols,
                             index=cols.index(time_guess))
 
     st.header("4 · Point-wise representative scan")
@@ -640,17 +759,34 @@ st.caption(
 )
 
 rows = []
+fit_rows = []
 for name in file_names:
     w = prepare(file_by_name[name])
     if w is None or w.empty:
         continue
+    label = point_label(name)
+    # representative metrics row
     s_df = per_scan_summary_silent(w)
     rep = representative_metrics(s_df, rep_mode)
-    if rep is None:
-        continue
-    rep_row = {"Point": point_label(name)}
-    rep_row.update(rep)
-    rows.append(rep_row)
+    if rep is not None:
+        rep_row = {"Point": label}
+        rep_row.update(rep)
+        rows.append(rep_row)
+    # exponential fit parameters (per point, anodic & cathodic)
+    at, ai, ct, ci = peak_time_series(w)
+    af = fit_exp_decay(at, ai)
+    cf = fit_exp_decay(ct, ci)
+    fit_rows.append({
+        "Point": label,
+        "Anodic C": af["C"] if af else np.nan,
+        "Anodic A": af["A"] if af else np.nan,
+        "Anodic k (1/s)": af["k"] if af else np.nan,
+        "Anodic R²": af["R2"] if af else np.nan,
+        "Cathodic C": cf["C"] if cf else np.nan,
+        "Cathodic A": cf["A"] if cf else np.nan,
+        "Cathodic k (1/s)": cf["k"] if cf else np.nan,
+        "Cathodic R²": cf["R2"] if cf else np.nan,
+    })
 
 if not rows:
     st.warning("No files produced valid metrics. Check the column selections.")
@@ -664,7 +800,6 @@ else:
         key="dl_pointwise",
     )
 
-    # six comparison curves
     x_pts = pw["Point"].tolist()
 
     def pw_chart(col, color):
@@ -694,3 +829,40 @@ else:
                 st.markdown(f"**{metric} vs point**")
                 st.plotly_chart(pw_chart(metric, color),
                                 use_container_width=True, key=f"pw_{i}_{j}")
+
+# Cross-point exponential-fit parameter table
+if fit_rows:
+    st.subheader("Exponential fit parameters per point  —  I(t) = C + A·exp(−k·t)")
+    st.caption(
+        "k = rate constant for surface change (1/s). Time measured from each "
+        "file's first peak. Anodic uses anodic peak current vs time; cathodic "
+        "uses cathodic peak current vs time."
+    )
+    fit_df = pd.DataFrame(fit_rows)
+    st.dataframe(fit_df, use_container_width=True, hide_index=True)
+    st.download_button(
+        "Download fit parameters (CSV)",
+        fit_df.to_csv(index=False).encode("utf-8"),
+        file_name="exp_fit_parameters.csv", mime="text/csv",
+        key="dl_fitparams",
+    )
+
+    # k vs point comparison (the headline quantity)
+    if "Anodic k (1/s)" in fit_df:
+        kfig = go.Figure()
+        kfig.add_trace(go.Scatter(
+            x=fit_df["Point"], y=fit_df["Anodic k (1/s)"], mode="lines+markers",
+            name="Anodic k", line=dict(color="#d62728", width=2),
+            marker=dict(size=8)))
+        kfig.add_trace(go.Scatter(
+            x=fit_df["Point"], y=fit_df["Cathodic k (1/s)"], mode="lines+markers",
+            name="Cathodic k", line=dict(color="#1f77b4", width=2),
+            marker=dict(size=8)))
+        kfig.update_layout(
+            xaxis_title="Point", yaxis_title="k (rate constant, 1/s)",
+            height=360, margin=dict(l=70, r=20, t=30, b=45),
+            template="plotly_white",
+            legend=dict(orientation="h", yanchor="bottom", y=1.02, xanchor="right", x=1),
+        )
+        st.markdown("**Rate constant k vs point**")
+        st.plotly_chart(kfig, use_container_width=True, key="k_vs_point")
