@@ -8,10 +8,17 @@ Upload MULTIPLE Excel files (name them "point 1" … "point 10"). For each file:
   - Peak current vs time for anode & cathode, each fitted to
         I(t) = C + A*exp(-k*t)
     where k is the rate constant for surface change. C, A, k and R² are tabled.
+  - Anodic / Cathodic CHARGE vs time (one charge per cycle plotted against the
+    time that marks the beginning of that cycle's anodic / cathodic scan), with a
+    user-selectable empirical fit:
+        Option 1:  Q(t) = Qbase + A(1−exp(−k1·t)) − B(1−exp(−k2·t))
+                   k1 = growth rate constant, k2 = decay rate constant
+        Option 2:  Q(t) = C + A·exp(−k·t)
+    Fitted parameters and R² are tabled and the fitted curve is plotted.
 
 Scan 1 is treated as a transient and is EXCLUDED from all comparison/trend
-graphs (a–h), the exponential fits, and the point-wise comparison. The raw
-peak tables and per-scan integration still show every scan.
+graphs (a–h), the exponential fits, the charge-vs-time fits, and the point-wise
+comparison. The raw peak tables and per-scan integration still show every scan.
 
 Expected columns:  Potential , WE(1).Current (A) , scan , and a time column.
 
@@ -37,6 +44,10 @@ PALETTE = (
     + px.colors.qualitative.Set2
     + px.colors.qualitative.Dark24
 )
+
+# Empirical models offered for the Charge-vs-time fit (dropdown labels).
+MODEL_GROWTH_DECAY = "Option 1:  Q(t) = Qbase + A(1−exp(−k₁·t)) − B(1−exp(−k₂·t))"
+MODEL_SINGLE_EXP = "Option 2:  Q(t) = C + A·exp(−k·t)"
 
 # ----------------------------------------------------------------------------
 # Helpers
@@ -203,6 +214,145 @@ def fit_params_table(anod_fit, cath_fit):
                     "k (rate constant, 1/s)": np.nan, "R²": np.nan}
         return {"Region": label, "C": fit["C"], "A": fit["A"],
                 "k (rate constant, 1/s)": fit["k"], "R²": fit["R2"]}
+    return pd.DataFrame([row("Anodic", anod_fit), row("Cathodic", cath_fit)])
+
+
+# ----------------------------------------------------------------------------
+# Charge-vs-time analysis
+#   - One charge per cycle (default Y = 0 baseline, Q = ∫ I dt over time).
+#   - Anodic charge is plotted against the time at the beginning of that cycle's
+#     anodic scan (= time at the lower potential vertex, where oxidation starts).
+#   - Cathodic charge is plotted against the time at the beginning of that cycle's
+#     cathodic scan (= time at the upper potential vertex, where reduction starts).
+#
+# Empirical models:
+#   Growth–decay:  Q(t) = Qbase + A(1−exp(−k1·t)) − B(1−exp(−k2·t))
+#                  k1 = growth rate constant, k2 = decay rate constant
+#   Single exp:    Q(t) = C + A·exp(−k·t)
+# t is measured from the first used cycle (scan 2), so all rate constants are
+# independent of the absolute time origin.
+# ----------------------------------------------------------------------------
+
+def growth_decay_model(t, Qbase, A, B, k1, k2):
+    return Qbase + A * (1.0 - np.exp(-k1 * t)) - B * (1.0 - np.exp(-k2 * t))
+
+
+def fit_growth_decay(t, Q):
+    """Fit Q(t)=Qbase+A(1-exp(-k1 t))-B(1-exp(-k2 t)). 5 free parameters, so at
+    least 5 cycles are needed. Rate constants are constrained to be ≥ 0.
+    Returns dict with Qbase, A, B, k1, k2, R2 — or None."""
+    t = np.asarray(t, dtype=float)
+    Q = np.asarray(Q, dtype=float)
+    if len(t) < 5:
+        return None
+    t0 = t - t.min()
+    span = t0.max() if t0.max() > 0 else 1.0
+    Qbase0 = float(Q[0])
+    total = float(Q[-1] - Q[0])
+    amp = float(np.max(Q) - np.min(Q)) or 1.0
+    A0 = amp
+    B0 = amp - total            # so that A0 - B0 ≈ Q(∞) - Q(0)
+    k1_0 = 3.0 / span           # growth assumed faster than decay
+    k2_0 = 1.0 / span
+    lower = [-np.inf, -np.inf, -np.inf, 0.0, 0.0]
+    upper = [np.inf, np.inf, np.inf, np.inf, np.inf]
+    try:
+        popt, _ = curve_fit(
+            growth_decay_model, t0, Q,
+            p0=[Qbase0, A0, B0, k1_0, k2_0],
+            bounds=(lower, upper), max_nfev=40000,
+        )
+        Qbase, A, B, k1, k2 = (float(v) for v in popt)
+        yhat = growth_decay_model(t0, Qbase, A, B, k1, k2)
+        ss_res = float(np.sum((Q - yhat) ** 2))
+        ss_tot = float(np.sum((Q - np.mean(Q)) ** 2))
+        r2 = 1 - ss_res / ss_tot if ss_tot > 0 else float("nan")
+        return {"Qbase": Qbase, "A": A, "B": B, "k1": k1, "k2": k2, "R2": r2}
+    except Exception:
+        return None
+
+
+def charge_time_series(work, skip_first=True):
+    """Per-cycle charge vs cycle-start-time.
+    Returns (anodic_t, anodic_Q, cathodic_t, cathodic_Q) as arrays, scan-ordered.
+    Anodic_Q = positive charge, Cathodic_Q = negative charge (default Y = 0
+    baseline). Anodic_t = time at lower potential vertex (anodic-scan start);
+    Cathodic_t = time at upper potential vertex (cathodic-scan start).
+    If skip_first, scan 1 is excluded."""
+    scans = sorted_scans(work)
+    if skip_first and len(scans) > 1:
+        scans = scans[1:]
+    at, aq, ct, cq = [], [], [], []
+    for s in scans:
+        sub = work[work["scan"] == s]
+        if len(sub) < 2:
+            continue
+        bl = np.zeros(len(sub))
+        pos_area, neg_area = trapz_signed(sub["time"].values,
+                                          sub["current"].values, bl)
+        # beginning of anodic scan = lower potential vertex (oxidation onset)
+        at.append(float(sub.loc[sub["potential"].idxmin(), "time"]))
+        aq.append(pos_area)
+        # beginning of cathodic scan = upper potential vertex (reduction onset)
+        ct.append(float(sub.loc[sub["potential"].idxmax(), "time"]))
+        cq.append(neg_area)
+    return (np.array(at), np.array(aq), np.array(ct), np.array(cq))
+
+
+def charge_fit_plot(t, Q, model_label, fit, title, color, key):
+    """Scatter of per-cycle charge vs time with the chosen fitted curve overlaid."""
+    f = go.Figure()
+    if len(t):
+        t_rel = t - t.min()
+        f.add_trace(go.Scatter(
+            x=t_rel, y=Q, mode="markers", name="Charge per cycle",
+            marker=dict(size=9, color=color),
+            hovertemplate="t=%{x:.1f} s<br>Q=%{y:.4g} C<extra></extra>",
+        ))
+        if fit is not None:
+            tt = np.linspace(t_rel.min(), t_rel.max(), 300)
+            if model_label == MODEL_GROWTH_DECAY:
+                yy = growth_decay_model(tt, fit["Qbase"], fit["A"], fit["B"],
+                                        fit["k1"], fit["k2"])
+                fit_name = "Qbase + A(1−e^(−k₁t)) − B(1−e^(−k₂t))"
+            else:
+                yy = exp_model(tt, fit["C"], fit["A"], fit["k"])
+                fit_name = "C + A·e^(−k·t)"
+            f.add_trace(go.Scatter(
+                x=tt, y=yy, mode="lines", name=fit_name,
+                line=dict(color="black", width=2, dash="dash"),
+                hoverinfo="skip",
+            ))
+    f.update_layout(
+        xaxis_title="Time since scan-2 cycle start (s)",
+        yaxis_title="Charge Q (C)", height=360,
+        margin=dict(l=70, r=20, t=30, b=45), template="plotly_white",
+        legend=dict(orientation="h", yanchor="bottom", y=1.02, xanchor="right", x=1),
+    )
+    st.markdown(f"**{title}**")
+    st.plotly_chart(f, use_container_width=True, key=key)
+
+
+def charge_fit_table(model_label, anod_fit, cath_fit):
+    """Tabulate fitted parameters + R² for the chosen Charge-vs-time model."""
+    if model_label == MODEL_GROWTH_DECAY:
+        def row(region, fit):
+            if fit is None:
+                return {"Region": region, "Qbase (C)": np.nan, "A (C)": np.nan,
+                        "B (C)": np.nan,
+                        "k₁ — growth rate constant (1/s)": np.nan,
+                        "k₂ — decay rate constant (1/s)": np.nan, "R²": np.nan}
+            return {"Region": region, "Qbase (C)": fit["Qbase"], "A (C)": fit["A"],
+                    "B (C)": fit["B"],
+                    "k₁ — growth rate constant (1/s)": fit["k1"],
+                    "k₂ — decay rate constant (1/s)": fit["k2"], "R²": fit["R2"]}
+    else:
+        def row(region, fit):
+            if fit is None:
+                return {"Region": region, "C (C)": np.nan, "A (C)": np.nan,
+                        "k — rate constant (1/s)": np.nan, "R²": np.nan}
+            return {"Region": region, "C (C)": fit["C"], "A (C)": fit["A"],
+                    "k — rate constant (1/s)": fit["k"], "R²": fit["R2"]}
     return pd.DataFrame([row("Anodic", anod_fit), row("Cathodic", cath_fit)])
 
 
@@ -612,6 +762,64 @@ def analyse_file(work, pot_col, cur_col, view_key):
     if anod_fit is None or cath_fit is None:
         st.caption("Note: a fit is shown only when a region has at least 4 scans "
                    "(after excluding scan 1) and the optimisation converges.")
+
+    # --- Charge vs time, selectable empirical fit (scan 1 excluded) ---
+    st.subheader("Charge vs time — empirical rate-constant fit")
+    st.caption(
+        "Scan 1 excluded. One charge per cycle (default Y = 0 baseline, "
+        "Q = ∫ I dt). The **anodic** charge is plotted against the time at the "
+        "beginning of that cycle's anodic scan (the lower-potential vertex where "
+        "oxidation starts); the **cathodic** charge is plotted against the time at "
+        "the beginning of that cycle's cathodic scan (the upper-potential vertex). "
+        "Time is measured from the first used cycle (scan 2, t = 0)."
+    )
+    qt_model = st.selectbox(
+        "Empirical model to fit Q vs t",
+        [MODEL_GROWTH_DECAY, MODEL_SINGLE_EXP],
+        index=0, key=f"qtmodel_{view_key}",
+    )
+    if qt_model == MODEL_GROWTH_DECAY:
+        st.markdown(
+            "**Legend** &nbsp;·&nbsp; "
+            "**k₁** = growth rate constant (1/s) &nbsp;·&nbsp; "
+            "**k₂** = decay rate constant (1/s) &nbsp;·&nbsp; "
+            "Qbase = baseline charge, A = growth amplitude, B = decay amplitude."
+        )
+    else:
+        st.markdown(
+            "**Legend** &nbsp;·&nbsp; "
+            "**k** = rate constant (1/s) &nbsp;·&nbsp; "
+            "C = offset, A = amplitude."
+        )
+
+    aqt, aq, cqt, cq = charge_time_series(work, skip_first=True)
+    if qt_model == MODEL_GROWTH_DECAY:
+        anod_qfit = fit_growth_decay(aqt, aq)
+        cath_qfit = fit_growth_decay(cqt, cq)
+    else:
+        anod_qfit = fit_exp_decay(aqt, aq)
+        cath_qfit = fit_exp_decay(cqt, cq)
+
+    qc1, qc2 = st.columns(2)
+    with qc1:
+        charge_fit_plot(aqt, aq, qt_model, anod_qfit,
+                        "Anodic charge vs time", "#d62728",
+                        key=f"qfit_anod_{view_key}")
+    with qc2:
+        charge_fit_plot(cqt, cq, qt_model, cath_qfit,
+                        "Cathodic charge vs time", "#1f77b4",
+                        key=f"qfit_cath_{view_key}")
+    st.markdown("**Fitted parameters**")
+    st.dataframe(charge_fit_table(qt_model, anod_qfit, cath_qfit),
+                 use_container_width=True, hide_index=True)
+    if anod_qfit is None or cath_qfit is None:
+        need = "5" if qt_model == MODEL_GROWTH_DECAY else "4"
+        st.caption(
+            f"Note: a fit is shown only when a region has at least {need} cycles "
+            "(after excluding scan 1) and the optimisation converges. The "
+            "growth–decay model has 5 free parameters, so more cycles give a more "
+            "reliable R² and better-separated k₁ / k₂."
+        )
 
     return summary
 
