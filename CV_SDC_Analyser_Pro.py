@@ -14,11 +14,12 @@ Upload MULTIPLE Excel files (name them "point 1" … "point 10"). For each file:
         Option 1:  Q(t) = Qbase + A(1−exp(−k1·t)) − B(1−exp(−k2·t))
                    k1 = growth rate constant, k2 = decay rate constant
         Option 2:  Q(t) = C + A·exp(−k·t)
-    Fitted parameters and R² are tabled and the fitted curve is plotted.
+    Fitted parameters and R² are tabled and the fitted curve is plotted, both per
+    file and as a per-point cross-comparison table.
 
-Scan 1 is treated as a transient and is EXCLUDED from all comparison/trend
-graphs (a–h), the exponential fits, the charge-vs-time fits, and the point-wise
-comparison. The raw peak tables and per-scan integration still show every scan.
+Scan 1 handling (keep or remove) is selectable in the sidebar and applies to all
+trend graphs (a–h), the exponential fits, and the charge-vs-time fits/tables.
+The raw peak tables and per-scan integration always show every scan.
 
 Expected columns:  Potential , WE(1).Current (A) , scan , and a time column.
 
@@ -198,7 +199,7 @@ def fit_plot(t, y, fit, title, color, key):
                 hoverinfo="skip",
             ))
     f.update_layout(
-        xaxis_title="Time since scan-2 peak (s)", yaxis_title="Peak current (A)",
+        xaxis_title="Time since first used peak (s)", yaxis_title="Peak current (A)",
         height=360, margin=dict(l=70, r=20, t=30, b=45),
         template="plotly_white",
         legend=dict(orientation="h", yanchor="bottom", y=1.02, xanchor="right", x=1),
@@ -229,8 +230,8 @@ def fit_params_table(anod_fit, cath_fit):
 #   Growth–decay:  Q(t) = Qbase + A(1−exp(−k1·t)) − B(1−exp(−k2·t))
 #                  k1 = growth rate constant, k2 = decay rate constant
 #   Single exp:    Q(t) = C + A·exp(−k·t)
-# t is measured from the first used cycle (scan 2), so all rate constants are
-# independent of the absolute time origin.
+# t is measured from the first used cycle, so all rate constants are independent
+# of the absolute time origin.
 # ----------------------------------------------------------------------------
 
 def growth_decay_model(t, Qbase, A, B, k1, k2):
@@ -324,7 +325,7 @@ def charge_fit_plot(t, Q, model_label, fit, title, color, key):
                 hoverinfo="skip",
             ))
     f.update_layout(
-        xaxis_title="Time since scan-2 cycle start (s)",
+        xaxis_title="Time since first used cycle (s)",
         yaxis_title="Charge Q (C)", height=360,
         margin=dict(l=70, r=20, t=30, b=45), template="plotly_white",
         legend=dict(orientation="h", yanchor="bottom", y=1.02, xanchor="right", x=1),
@@ -354,6 +355,37 @@ def charge_fit_table(model_label, anod_fit, cath_fit):
             return {"Region": region, "C (C)": fit["C"], "A (C)": fit["A"],
                     "k — rate constant (1/s)": fit["k"], "R²": fit["R2"]}
     return pd.DataFrame([row("Anodic", anod_fit), row("Cathodic", cath_fit)])
+
+
+def charge_fit_row(label, model_label, anod_fit, cath_fit):
+    """One per-point row of Charge-vs-time fit parameters for the chosen model."""
+    if model_label == MODEL_GROWTH_DECAY:
+        return {
+            "Point": label,
+            "Anodic Qbase (C)": anod_fit["Qbase"] if anod_fit else np.nan,
+            "Anodic A (C)": anod_fit["A"] if anod_fit else np.nan,
+            "Anodic B (C)": anod_fit["B"] if anod_fit else np.nan,
+            "Anodic k₁ (1/s)": anod_fit["k1"] if anod_fit else np.nan,
+            "Anodic k₂ (1/s)": anod_fit["k2"] if anod_fit else np.nan,
+            "Anodic R²": anod_fit["R2"] if anod_fit else np.nan,
+            "Cathodic Qbase (C)": cath_fit["Qbase"] if cath_fit else np.nan,
+            "Cathodic A (C)": cath_fit["A"] if cath_fit else np.nan,
+            "Cathodic B (C)": cath_fit["B"] if cath_fit else np.nan,
+            "Cathodic k₁ (1/s)": cath_fit["k1"] if cath_fit else np.nan,
+            "Cathodic k₂ (1/s)": cath_fit["k2"] if cath_fit else np.nan,
+            "Cathodic R²": cath_fit["R2"] if cath_fit else np.nan,
+        }
+    return {
+        "Point": label,
+        "Anodic C (C)": anod_fit["C"] if anod_fit else np.nan,
+        "Anodic A (C)": anod_fit["A"] if anod_fit else np.nan,
+        "Anodic k (1/s)": anod_fit["k"] if anod_fit else np.nan,
+        "Anodic R²": anod_fit["R2"] if anod_fit else np.nan,
+        "Cathodic C (C)": cath_fit["C"] if cath_fit else np.nan,
+        "Cathodic A (C)": cath_fit["A"] if cath_fit else np.nan,
+        "Cathodic k (1/s)": cath_fit["k"] if cath_fit else np.nan,
+        "Cathodic R²": cath_fit["R2"] if cath_fit else np.nan,
+    }
 
 
 # ----------------------------------------------------------------------------
@@ -574,7 +606,7 @@ refresh();
 # Per-file analysis
 # ----------------------------------------------------------------------------
 
-def analyse_file(work, pot_col, cur_col, view_key):
+def analyse_file(work, pot_col, cur_col, view_key, skip_first):
     scans = sorted_scans(work)
     color_map = {s: PALETTE[i % len(PALETTE)] for i, s in enumerate(scans)}
     unit_label = "C"
@@ -695,17 +727,24 @@ def analyse_file(work, pot_col, cur_col, view_key):
         key=f"dl_{view_key}",
     )
 
-    # --- Trend-vs-scan plots (a–h): EXCLUDE scan 1, start from scan 2 ---
-    st.subheader("Trends vs scan number (scan 1 excluded)")
-    st.caption("Scan 1 is treated as a transient and omitted; trends start at scan 2.")
-    summary_t = summary[summary["Scan"] != first_scan].reset_index(drop=True)
+    # --- Trend-vs-scan plots (a–h): scan 1 kept or removed per setting ---
+    if skip_first:
+        st.subheader("Trends vs scan number (scan 1 excluded)")
+        st.caption("Scan 1 is treated as a transient and omitted; trends start at scan 2.")
+        summary_t = summary[summary["Scan"] != first_scan].reset_index(drop=True)
+        fallback_start = 2
+    else:
+        st.subheader("Trends vs scan number (all scans)")
+        st.caption("All scans included; trends start at scan 1.")
+        summary_t = summary.reset_index(drop=True)
+        fallback_start = 1
     if summary_t.empty:
-        st.info("Not enough scans after excluding scan 1 to plot trends.")
+        st.info("No scans available to plot trends with the current scan-1 setting.")
     else:
         try:
             x_scan = [float(s) for s in summary_t["Scan"]]
         except (ValueError, TypeError):
-            x_scan = list(range(2, len(summary_t) + 2))
+            x_scan = list(range(fallback_start, len(summary_t) + fallback_start))
         pos_q_col = f"Positive charge ({unit_label})"
         neg_q_col = f"Negative charge ({unit_label})"
 
@@ -740,13 +779,16 @@ def analyse_file(work, pot_col, cur_col, view_key):
                                     use_container_width=True,
                                     key=f"trend_{view_key}_{i}_{j}")
 
-    # --- Peak current vs time, exponential fit (scan 1 excluded) ---
+    ref_label = "first used scan (scan 2)" if skip_first else "first scan (scan 1)"
+
+    # --- Peak current vs time, exponential fit ---
     st.subheader("Peak current vs time — exponential fit  I(t) = C + A·exp(−k·t)")
     st.caption(
-        "Scan 1 excluded. k is the **rate constant for surface change**. Time is "
-        "measured from the scan-2 peak (t = 0). Fit by non-linear least squares."
+        f"{'Scan 1 excluded. ' if skip_first else 'All scans included. '}"
+        f"k is the **rate constant for surface change**. Time is measured from the "
+        f"{ref_label} (t = 0). Fit by non-linear least squares."
     )
-    at, ai, ct, ci = peak_time_series(work, skip_first=True)
+    at, ai, ct, ci = peak_time_series(work, skip_first=skip_first)
     anod_fit = fit_exp_decay(at, ai)
     cath_fit = fit_exp_decay(ct, ci)
     fc1, fc2 = st.columns(2)
@@ -761,20 +803,20 @@ def analyse_file(work, pot_col, cur_col, view_key):
                  use_container_width=True, hide_index=True)
     if anod_fit is None or cath_fit is None:
         st.caption("Note: a fit is shown only when a region has at least 4 scans "
-                   "(after excluding scan 1) and the optimisation converges.")
+                   "(with the current scan-1 setting) and the optimisation converges.")
 
-    # --- Charge vs time, selectable empirical fit (scan 1 excluded) ---
+    # --- Charge vs time, selectable empirical fit ---
     st.subheader("Charge vs time — empirical rate-constant fit")
     st.caption(
-        "Scan 1 excluded. One charge per cycle (default Y = 0 baseline, "
-        "Q = ∫ I dt). The **anodic** charge is plotted against the time at the "
-        "beginning of that cycle's anodic scan (the lower-potential vertex where "
-        "oxidation starts); the **cathodic** charge is plotted against the time at "
-        "the beginning of that cycle's cathodic scan (the upper-potential vertex). "
-        "Time is measured from the first used cycle (scan 2, t = 0)."
+        f"{'Scan 1 excluded. ' if skip_first else 'All scans included. '}"
+        "One charge per cycle (default Y = 0 baseline, Q = ∫ I dt). The **anodic** "
+        "charge is plotted against the time at the beginning of that cycle's anodic "
+        "scan (the lower-potential vertex where oxidation starts); the **cathodic** "
+        "charge against the time at the beginning of that cycle's cathodic scan "
+        f"(the upper-potential vertex). Time is measured from the {ref_label} (t = 0)."
     )
     qt_model = st.selectbox(
-        "Empirical model to fit Q vs t",
+        "Empirical model to fit Q vs t (this file)",
         [MODEL_GROWTH_DECAY, MODEL_SINGLE_EXP],
         index=0, key=f"qtmodel_{view_key}",
     )
@@ -792,7 +834,7 @@ def analyse_file(work, pot_col, cur_col, view_key):
             "C = offset, A = amplitude."
         )
 
-    aqt, aq, cqt, cq = charge_time_series(work, skip_first=True)
+    aqt, aq, cqt, cq = charge_time_series(work, skip_first=skip_first)
     if qt_model == MODEL_GROWTH_DECAY:
         anod_qfit = fit_growth_decay(aqt, aq)
         cath_qfit = fit_growth_decay(cqt, cq)
@@ -816,7 +858,7 @@ def analyse_file(work, pot_col, cur_col, view_key):
         need = "5" if qt_model == MODEL_GROWTH_DECAY else "4"
         st.caption(
             f"Note: a fit is shown only when a region has at least {need} cycles "
-            "(after excluding scan 1) and the optimisation converges. The "
+            "(with the current scan-1 setting) and the optimisation converges. The "
             "growth–decay model has 5 free parameters, so more cycles give a more "
             "reliable R² and better-separated k₁ / k₂."
         )
@@ -848,17 +890,19 @@ def per_scan_summary_silent(work):
     return pd.DataFrame(rows)
 
 
-def representative_metrics(summary, mode):
+def representative_metrics(summary, mode, skip_first):
     """Collapse per-scan summary to one representative row.
-    Modes: 'Last scan (steady state)', 'Scan 2', 'Mean across scans (scan 2+)'."""
+    Modes: 'Last scan (steady state)', 'First used scan', 'Mean across used scans'.
+    'used scans' = scan 2+ when skip_first, else all scans."""
     if summary.empty:
         return None
     pos_col = [c for c in summary.columns if c.startswith("Positive charge")][0]
     neg_col = [c for c in summary.columns if c.startswith("Negative charge")][0]
-    if mode == "Scan 2":
-        row = summary.iloc[1] if len(summary) >= 2 else summary.iloc[0]
-    elif mode == "Mean across scans (scan 2+)":
-        sub = summary.iloc[1:] if len(summary) > 1 else summary
+    start = 1 if (skip_first and len(summary) > 1) else 0
+    if mode == "First used scan":
+        row = summary.iloc[start]
+    elif mode == "Mean across used scans":
+        sub = summary.iloc[start:] if len(summary) > start else summary
         row = sub.mean(numeric_only=True)
     else:  # Last scan (steady state)
         row = summary.iloc[-1]
@@ -885,7 +929,7 @@ st.title("Cyclic Voltammetry — Charge Integration (multi-file)")
 st.caption(
     "Upload several Excel files (name them 'point 1' … 'point 10'). View each "
     "file's full analysis from the dropdown; see the point-wise comparison below. "
-    "Scan 1 is excluded from all comparison/trend graphs."
+    "Scan 1 can be kept or removed for the trend/fit plots (sidebar)."
 )
 
 with st.sidebar:
@@ -924,10 +968,25 @@ with st.sidebar:
     time_col = st.selectbox("Time (s) — for charge integration & fits", cols,
                             index=cols.index(time_guess))
 
-    st.header("4 · Point-wise representative scan")
+    st.header("4 · Scan 1 handling")
+    scan1_mode = st.radio(
+        "Scan 1 in trend / fit plots",
+        ["Exclude scan 1 (transient)", "Include scan 1"],
+        index=0,
+    )
+    skip_first = scan1_mode.startswith("Exclude")
+
+    st.header("5 · Point-wise representative scan")
     rep_mode = st.radio(
         "Value used per point in the comparison",
-        ["Last scan (steady state)", "Scan 2", "Mean across scans (scan 2+)"],
+        ["Last scan (steady state)", "First used scan", "Mean across used scans"],
+        index=0,
+    )
+
+    st.header("6 · Charge-vs-time fit (point-wise table)")
+    pw_qt_model = st.selectbox(
+        "Model for the per-point Q-vs-t table",
+        [MODEL_GROWTH_DECAY, MODEL_SINGLE_EXP],
         index=0,
     )
 
@@ -955,35 +1014,38 @@ if work is None or work.empty:
     st.error(f"'{selected_name}' is missing one of the required columns "
              f"({pot_col}, {cur_col}, {scan_col}, {time_col}) or has no valid rows.")
 else:
-    analyse_file(work, pot_col, cur_col, view_key)
+    analyse_file(work, pot_col, cur_col, view_key, skip_first)
 
 # ----------------------------------------------------------------------------
-# Point-wise comparison across all files (scan 1 excluded)
+# Point-wise comparison across all files
 # ----------------------------------------------------------------------------
 
 st.markdown("---")
 st.header("Point-wise comparison")
 st.caption(
-    f"One representative value per file using: **{rep_mode}**. Scan 1 is excluded. "
+    f"One representative value per file using: **{rep_mode}**. "
+    f"{'Scan 1 excluded from fits/representative selection. ' if skip_first else 'Scan 1 included. '}"
     "Anodic = positive charge, Cathodic = negative charge. "
     "Charges use the default Y = 0 baseline."
 )
 
 rows = []
 fit_rows = []
+qt_fit_rows = []
 for name in file_names:
     w = prepare(file_by_name[name])
     if w is None or w.empty:
         continue
     label = point_label(name)
     s_df = per_scan_summary_silent(w)
-    rep = representative_metrics(s_df, rep_mode)
+    rep = representative_metrics(s_df, rep_mode, skip_first)
     if rep is not None:
         rep_row = {"Point": label}
         rep_row.update(rep)
         rows.append(rep_row)
-    # exponential fit (scan 1 excluded)
-    at, ai, ct, ci = peak_time_series(w, skip_first=True)
+
+    # Peak-current exponential fit (scan-1 setting applied)
+    at, ai, ct, ci = peak_time_series(w, skip_first=skip_first)
     af = fit_exp_decay(at, ai)
     cf = fit_exp_decay(ct, ci)
     fit_rows.append({
@@ -997,6 +1059,16 @@ for name in file_names:
         "Cathodic k (1/s)": cf["k"] if cf else np.nan,
         "Cathodic R²": cf["R2"] if cf else np.nan,
     })
+
+    # Charge-vs-time fit (selected model, scan-1 setting applied)
+    aqt, aq, cqt, cq = charge_time_series(w, skip_first=skip_first)
+    if pw_qt_model == MODEL_GROWTH_DECAY:
+        aqf = fit_growth_decay(aqt, aq)
+        cqf = fit_growth_decay(cqt, cq)
+    else:
+        aqf = fit_exp_decay(aqt, aq)
+        cqf = fit_exp_decay(cqt, cq)
+    qt_fit_rows.append(charge_fit_row(label, pw_qt_model, aqf, cqf))
 
 if not rows:
     st.warning("No files produced valid metrics. Check the column selections.")
@@ -1040,17 +1112,18 @@ else:
                 st.plotly_chart(pw_chart(metric, color),
                                 use_container_width=True, key=f"pw_{i}_{j}")
 
-# Cross-point exponential-fit parameter table (scan 1 excluded)
+# Cross-point peak-current exponential-fit parameter table
 if fit_rows:
-    st.subheader("Exponential fit parameters per point  —  I(t) = C + A·exp(−k·t)")
+    st.subheader("Peak-current exponential fit parameters per point  —  I(t) = C + A·exp(−k·t)")
     st.caption(
-        "Scan 1 excluded. k = rate constant for surface change (1/s). Time "
-        "measured from each file's scan-2 peak."
+        f"{'Scan 1 excluded. ' if skip_first else 'All scans included. '}"
+        "k = rate constant for surface change (1/s). Time measured from each "
+        "file's first used peak."
     )
     fit_df = pd.DataFrame(fit_rows)
     st.dataframe(fit_df, use_container_width=True, hide_index=True)
     st.download_button(
-        "Download fit parameters (CSV)",
+        "Download peak-current fit parameters (CSV)",
         fit_df.to_csv(index=False).encode("utf-8"),
         file_name="exp_fit_parameters.csv", mime="text/csv",
         key="dl_fitparams",
@@ -1069,5 +1142,71 @@ if fit_rows:
             height=360, margin=dict(l=70, r=20, t=30, b=45),
             template="plotly_white",
             legend=dict(orientation="h", yanchor="bottom", y=1.02, xanchor="right", x=1))
-        st.markdown("**Rate constant k vs point**")
+        st.markdown("**Peak-current rate constant k vs point**")
         st.plotly_chart(kfig, use_container_width=True, key="k_vs_point")
+
+# Cross-point CHARGE-vs-time fit parameter table
+if qt_fit_rows:
+    if pw_qt_model == MODEL_GROWTH_DECAY:
+        st.subheader(
+            "Charge-vs-time fit parameters per point  —  "
+            "Q(t) = Qbase + A(1−exp(−k₁·t)) − B(1−exp(−k₂·t))"
+        )
+        st.caption(
+            f"{'Scan 1 excluded. ' if skip_first else 'All scans included. '}"
+            "**k₁** = growth rate constant (1/s), **k₂** = decay rate constant "
+            "(1/s). Anodic = positive charge, Cathodic = negative charge. Time "
+            "measured from each file's first used cycle."
+        )
+    else:
+        st.subheader(
+            "Charge-vs-time fit parameters per point  —  Q(t) = C + A·exp(−k·t)"
+        )
+        st.caption(
+            f"{'Scan 1 excluded. ' if skip_first else 'All scans included. '}"
+            "**k** = rate constant (1/s). Anodic = positive charge, Cathodic = "
+            "negative charge. Time measured from each file's first used cycle."
+        )
+    qt_df = pd.DataFrame(qt_fit_rows)
+    st.dataframe(qt_df, use_container_width=True, hide_index=True)
+    st.download_button(
+        "Download charge-vs-time fit parameters (CSV)",
+        qt_df.to_csv(index=False).encode("utf-8"),
+        file_name="charge_time_fit_parameters.csv", mime="text/csv",
+        key="dl_qtfitparams",
+    )
+
+    def k_vs_point_chart(anod_col, cath_col, y_title, title, key):
+        f = go.Figure()
+        if anod_col in qt_df:
+            f.add_trace(go.Scatter(
+                x=qt_df["Point"], y=qt_df[anod_col], mode="lines+markers",
+                name="Anodic", line=dict(color="#d62728", width=2),
+                marker=dict(size=8)))
+        if cath_col in qt_df:
+            f.add_trace(go.Scatter(
+                x=qt_df["Point"], y=qt_df[cath_col], mode="lines+markers",
+                name="Cathodic", line=dict(color="#1f77b4", width=2),
+                marker=dict(size=8)))
+        f.update_layout(
+            xaxis_title="Point", yaxis_title=y_title, height=340,
+            margin=dict(l=70, r=20, t=30, b=45), template="plotly_white",
+            legend=dict(orientation="h", yanchor="bottom", y=1.02,
+                        xanchor="right", x=1))
+        st.markdown(f"**{title}**")
+        st.plotly_chart(f, use_container_width=True, key=key)
+
+    if pw_qt_model == MODEL_GROWTH_DECAY:
+        kc1, kc2 = st.columns(2)
+        with kc1:
+            k_vs_point_chart("Anodic k₁ (1/s)", "Cathodic k₁ (1/s)",
+                             "k₁ — growth rate constant (1/s)",
+                             "Growth rate constant k₁ vs point", "qt_k1_vs_point")
+        with kc2:
+            k_vs_point_chart("Anodic k₂ (1/s)", "Cathodic k₂ (1/s)",
+                             "k₂ — decay rate constant (1/s)",
+                             "Decay rate constant k₂ vs point", "qt_k2_vs_point")
+    else:
+        k_vs_point_chart("Anodic k (1/s)", "Cathodic k (1/s)",
+                         "k — rate constant (1/s)",
+                         "Charge-vs-time rate constant k vs point", "qt_k_vs_point")
