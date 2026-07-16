@@ -17,9 +17,16 @@ Upload MULTIPLE Excel files (name them "point 1" … "point 10"). For each file:
     Fitted parameters and R² are tabled and the fitted curve is plotted, both per
     file and as a per-point cross-comparison table.
 
+Across files:
+  - Overlay of WE(1).Current (A) vs time. Tick which points to include; each
+    point is drawn as ONE thin line in ONE colour (all its scans joined), with a
+    legend entry per point.
+  - Point-wise comparison tables/plots and fit-parameter tables.
+
 Scan 1 handling (keep or remove) is selectable in the sidebar and applies to all
 trend graphs (a–h), the exponential fits, and the charge-vs-time fits/tables.
-The raw peak tables and per-scan integration always show every scan.
+The raw peak tables, per-scan integration, and the current-vs-time overlay always
+show every scan.
 
 Expected columns:  Potential , WE(1).Current (A) , scan , and a time column.
 
@@ -220,18 +227,6 @@ def fit_params_table(anod_fit, cath_fit):
 
 # ----------------------------------------------------------------------------
 # Charge-vs-time analysis
-#   - One charge per cycle (default Y = 0 baseline, Q = ∫ I dt over time).
-#   - Anodic charge is plotted against the time at the beginning of that cycle's
-#     anodic scan (= time at the lower potential vertex, where oxidation starts).
-#   - Cathodic charge is plotted against the time at the beginning of that cycle's
-#     cathodic scan (= time at the upper potential vertex, where reduction starts).
-#
-# Empirical models:
-#   Growth–decay:  Q(t) = Qbase + A(1−exp(−k1·t)) − B(1−exp(−k2·t))
-#                  k1 = growth rate constant, k2 = decay rate constant
-#   Single exp:    Q(t) = C + A·exp(−k·t)
-# t is measured from the first used cycle, so all rate constants are independent
-# of the absolute time origin.
 # ----------------------------------------------------------------------------
 
 def growth_decay_model(t, Qbase, A, B, k1, k2):
@@ -240,8 +235,7 @@ def growth_decay_model(t, Qbase, A, B, k1, k2):
 
 def fit_growth_decay(t, Q):
     """Fit Q(t)=Qbase+A(1-exp(-k1 t))-B(1-exp(-k2 t)). 5 free parameters, so at
-    least 5 cycles are needed. Rate constants are constrained to be ≥ 0.
-    Returns dict with Qbase, A, B, k1, k2, R2 — or None."""
+    least 5 cycles are needed. Rate constants are constrained to be ≥ 0."""
     t = np.asarray(t, dtype=float)
     Q = np.asarray(Q, dtype=float)
     if len(t) < 5:
@@ -252,8 +246,8 @@ def fit_growth_decay(t, Q):
     total = float(Q[-1] - Q[0])
     amp = float(np.max(Q) - np.min(Q)) or 1.0
     A0 = amp
-    B0 = amp - total            # so that A0 - B0 ≈ Q(∞) - Q(0)
-    k1_0 = 3.0 / span           # growth assumed faster than decay
+    B0 = amp - total
+    k1_0 = 3.0 / span
     k2_0 = 1.0 / span
     lower = [-np.inf, -np.inf, -np.inf, 0.0, 0.0]
     upper = [np.inf, np.inf, np.inf, np.inf, np.inf]
@@ -274,12 +268,7 @@ def fit_growth_decay(t, Q):
 
 
 def charge_time_series(work, skip_first=True):
-    """Per-cycle charge vs cycle-start-time.
-    Returns (anodic_t, anodic_Q, cathodic_t, cathodic_Q) as arrays, scan-ordered.
-    Anodic_Q = positive charge, Cathodic_Q = negative charge (default Y = 0
-    baseline). Anodic_t = time at lower potential vertex (anodic-scan start);
-    Cathodic_t = time at upper potential vertex (cathodic-scan start).
-    If skip_first, scan 1 is excluded."""
+    """Per-cycle charge vs cycle-start-time."""
     scans = sorted_scans(work)
     if skip_first and len(scans) > 1:
         scans = scans[1:]
@@ -291,17 +280,14 @@ def charge_time_series(work, skip_first=True):
         bl = np.zeros(len(sub))
         pos_area, neg_area = trapz_signed(sub["time"].values,
                                           sub["current"].values, bl)
-        # beginning of anodic scan = lower potential vertex (oxidation onset)
         at.append(float(sub.loc[sub["potential"].idxmin(), "time"]))
         aq.append(pos_area)
-        # beginning of cathodic scan = upper potential vertex (reduction onset)
         ct.append(float(sub.loc[sub["potential"].idxmax(), "time"]))
         cq.append(neg_area)
     return (np.array(at), np.array(aq), np.array(ct), np.array(cq))
 
 
 def charge_fit_plot(t, Q, model_label, fit, title, color, key):
-    """Scatter of per-cycle charge vs time with the chosen fitted curve overlaid."""
     f = go.Figure()
     if len(t):
         t_rel = t - t.min()
@@ -335,7 +321,6 @@ def charge_fit_plot(t, Q, model_label, fit, title, color, key):
 
 
 def charge_fit_table(model_label, anod_fit, cath_fit):
-    """Tabulate fitted parameters + R² for the chosen Charge-vs-time model."""
     if model_label == MODEL_GROWTH_DECAY:
         def row(region, fit):
             if fit is None:
@@ -358,7 +343,6 @@ def charge_fit_table(model_label, anod_fit, cath_fit):
 
 
 def charge_fit_row(label, model_label, anod_fit, cath_fit):
-    """One per-point row of Charge-vs-time fit parameters for the chosen model."""
     if model_label == MODEL_GROWTH_DECAY:
         return {
             "Point": label,
@@ -612,7 +596,6 @@ def analyse_file(work, pot_col, cur_col, view_key, skip_first):
     unit_label = "C"
     first_scan = scans[0] if scans else None
 
-    # Combined plot (all scans)
     st.subheader("Combined CV — all scans")
     fig = go.Figure()
     for s in scans:
@@ -629,7 +612,6 @@ def analyse_file(work, pot_col, cur_col, view_key, skip_first):
     )
     st.plotly_chart(fig, use_container_width=True, key=f"combined_{view_key}")
 
-    # Peak tables (all scans)
     st.subheader("Peak current / voltage per scan")
     st.caption(
         "Positive region = maximum (anodic) current; Negative region = minimum "
@@ -663,7 +645,6 @@ def analyse_file(work, pot_col, cur_col, view_key, skip_first):
         st.markdown("**Negative region (cathodic peak)**")
         st.dataframe(pd.DataFrame(neg_rows), use_container_width=True, hide_index=True)
 
-    # Per-scan draw/drag integration (all scans)
     st.subheader("Per-scan integration — draw or drag the baseline")
     st.caption(
         "Default baseline is horizontal at Y = 0 (the current axis). Area above the "
@@ -716,7 +697,6 @@ def analyse_file(work, pot_col, cur_col, view_key, skip_first):
     if summary.empty:
         return summary
 
-    # Summary table (all scans)
     st.subheader("Charge summary — all scans (default baseline)")
     st.caption("Charge = ∫ I dt over the time column, default Y = 0 baseline (coulombs).")
     st.dataframe(summary, use_container_width=True, hide_index=True)
@@ -727,7 +707,6 @@ def analyse_file(work, pot_col, cur_col, view_key, skip_first):
         key=f"dl_{view_key}",
     )
 
-    # --- Trend-vs-scan plots (a–h): scan 1 kept or removed per setting ---
     if skip_first:
         st.subheader("Trends vs scan number (scan 1 excluded)")
         st.caption("Scan 1 is treated as a transient and omitted; trends start at scan 2.")
@@ -781,7 +760,6 @@ def analyse_file(work, pot_col, cur_col, view_key, skip_first):
 
     ref_label = "first used scan (scan 2)" if skip_first else "first scan (scan 1)"
 
-    # --- Peak current vs time, exponential fit ---
     st.subheader("Peak current vs time — exponential fit  I(t) = C + A·exp(−k·t)")
     st.caption(
         f"{'Scan 1 excluded. ' if skip_first else 'All scans included. '}"
@@ -805,7 +783,6 @@ def analyse_file(work, pot_col, cur_col, view_key, skip_first):
         st.caption("Note: a fit is shown only when a region has at least 4 scans "
                    "(with the current scan-1 setting) and the optimisation converges.")
 
-    # --- Charge vs time, selectable empirical fit ---
     st.subheader("Charge vs time — empirical rate-constant fit")
     st.caption(
         f"{'Scan 1 excluded. ' if skip_first else 'All scans included. '}"
@@ -867,8 +844,6 @@ def analyse_file(work, pot_col, cur_col, view_key, skip_first):
 
 
 def per_scan_summary_silent(work):
-    """Per-scan metrics for a file WITHOUT rendering (default Y = 0 baseline).
-    Rows are in sorted scan order and carry the scan label."""
     scans = sorted_scans(work)
     rows = []
     for s in scans:
@@ -891,9 +866,6 @@ def per_scan_summary_silent(work):
 
 
 def representative_metrics(summary, mode, skip_first):
-    """Collapse per-scan summary to one representative row.
-    Modes: 'Last scan (steady state)', 'First used scan', 'Mean across used scans'.
-    'used scans' = scan 2+ when skip_first, else all scans."""
     if summary.empty:
         return None
     pos_col = [c for c in summary.columns if c.startswith("Positive charge")][0]
@@ -904,7 +876,7 @@ def representative_metrics(summary, mode, skip_first):
     elif mode == "Mean across used scans":
         sub = summary.iloc[start:] if len(summary) > start else summary
         row = sub.mean(numeric_only=True)
-    else:  # Last scan (steady state)
+    else:
         row = summary.iloc[-1]
     anodic_I = float(row["Anodic peak I (A)"])
     cathodic_I = float(row["Cathodic peak I (A)"])
@@ -928,8 +900,8 @@ def representative_metrics(summary, mode, skip_first):
 st.title("Cyclic Voltammetry — Charge Integration (multi-file)")
 st.caption(
     "Upload several Excel files (name them 'point 1' … 'point 10'). View each "
-    "file's full analysis from the dropdown; see the point-wise comparison below. "
-    "Scan 1 can be kept or removed for the trend/fit plots (sidebar)."
+    "file's full analysis from the dropdown; overlay current vs time across "
+    "points; see the point-wise comparison below."
 )
 
 with st.sidebar:
@@ -990,6 +962,9 @@ with st.sidebar:
         index=0,
     )
 
+    st.header("7 · Overlay appearance")
+    overlay_width = st.slider("Overlay line thickness", 0.2, 2.0, 0.7, 0.1)
+
 
 def prepare(file_obj):
     df = load_excel(file_obj.getvalue(), sheet)
@@ -1015,6 +990,64 @@ if work is None or work.empty:
              f"({pot_col}, {cur_col}, {scan_col}, {time_col}) or has no valid rows.")
 else:
     analyse_file(work, pot_col, cur_col, view_key, skip_first)
+
+# ----------------------------------------------------------------------------
+# Overlay: current vs time across selected points
+# ----------------------------------------------------------------------------
+
+st.markdown("---")
+st.header("Overlay — current vs time")
+st.caption(
+    "Tick the points to include. Each point is drawn as a single thin line in one "
+    "colour (all of its scans joined in time order); the legend names the point. "
+    "All scans are included here regardless of the scan-1 setting."
+)
+
+# Fixed colour per point, so a point keeps its colour whatever the selection is.
+overlay_colors = {name: PALETTE[i % len(PALETTE)] for i, name in enumerate(file_names)}
+
+sel_all_c1, sel_all_c2, _ = st.columns([1, 1, 4])
+with sel_all_c1:
+    if st.button("Select all", key="ovl_all"):
+        for name in file_names:
+            st.session_state[f"ovl_{safe_key(name)}"] = True
+with sel_all_c2:
+    if st.button("Clear all", key="ovl_none"):
+        for name in file_names:
+            st.session_state[f"ovl_{safe_key(name)}"] = False
+
+n_cb_cols = 4
+cb_cols = st.columns(n_cb_cols)
+selected_overlay = []
+for i, name in enumerate(file_names):
+    with cb_cols[i % n_cb_cols]:
+        checked = st.checkbox(point_label(name), value=True,
+                              key=f"ovl_{safe_key(name)}")
+    if checked:
+        selected_overlay.append(name)
+
+if not selected_overlay:
+    st.info("Tick at least one point to build the overlay.")
+else:
+    ofig = go.Figure()
+    for name in selected_overlay:
+        w = prepare(file_by_name[name])
+        if w is None or w.empty:
+            continue
+        wt = w.sort_values("time")
+        label = point_label(name)
+        ofig.add_trace(go.Scatter(
+            x=wt["time"], y=wt["current"], mode="lines", name=label,
+            line=dict(color=overlay_colors[name], width=overlay_width),
+            hovertemplate=label + "<br>t=%{x:.1f} s<br>I=%{y:.3e} A<extra></extra>",
+        ))
+    ofig.update_layout(
+        xaxis_title=time_col, yaxis_title=cur_col, height=580,
+        margin=dict(l=70, r=20, t=30, b=50), template="plotly_white",
+        hovermode="closest",
+        legend=dict(title="Point", itemsizing="constant"),
+    )
+    st.plotly_chart(ofig, use_container_width=True, key="overlay_current_time")
 
 # ----------------------------------------------------------------------------
 # Point-wise comparison across all files
@@ -1044,7 +1077,6 @@ for name in file_names:
         rep_row.update(rep)
         rows.append(rep_row)
 
-    # Peak-current exponential fit (scan-1 setting applied)
     at, ai, ct, ci = peak_time_series(w, skip_first=skip_first)
     af = fit_exp_decay(at, ai)
     cf = fit_exp_decay(ct, ci)
@@ -1060,7 +1092,6 @@ for name in file_names:
         "Cathodic R²": cf["R2"] if cf else np.nan,
     })
 
-    # Charge-vs-time fit (selected model, scan-1 setting applied)
     aqt, aq, cqt, cq = charge_time_series(w, skip_first=skip_first)
     if pw_qt_model == MODEL_GROWTH_DECAY:
         aqf = fit_growth_decay(aqt, aq)
@@ -1112,7 +1143,6 @@ else:
                 st.plotly_chart(pw_chart(metric, color),
                                 use_container_width=True, key=f"pw_{i}_{j}")
 
-# Cross-point peak-current exponential-fit parameter table
 if fit_rows:
     st.subheader("Peak-current exponential fit parameters per point  —  I(t) = C + A·exp(−k·t)")
     st.caption(
@@ -1145,7 +1175,6 @@ if fit_rows:
         st.markdown("**Peak-current rate constant k vs point**")
         st.plotly_chart(kfig, use_container_width=True, key="k_vs_point")
 
-# Cross-point CHARGE-vs-time fit parameter table
 if qt_fit_rows:
     if pw_qt_model == MODEL_GROWTH_DECAY:
         st.subheader(
