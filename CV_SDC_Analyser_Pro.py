@@ -18,8 +18,9 @@ Upload MULTIPLE Excel files (name them "point 1" … "point 10"). For each file:
     file and as a per-point cross-comparison table.
 
 Across files:
-  - Overlay of WE(1).Current (A) vs time. Tick which points to include; each
-    point is drawn as ONE thin line in ONE colour (all its scans joined), with a
+  - Overlay of WE(1).Current (A) vs time on a COMMON time frame: every selected
+    point is drawn on the time frame of a reference point (default Point 1), so
+    the cycles line up on top of each other. One thin line, one colour, one
     legend entry per point.
   - Point-wise comparison tables/plots and fit-parameter tables.
 
@@ -56,6 +57,11 @@ PALETTE = (
 # Empirical models offered for the Charge-vs-time fit (dropdown labels).
 MODEL_GROWTH_DECAY = "Option 1:  Q(t) = Qbase + A(1−exp(−k₁·t)) − B(1−exp(−k₂·t))"
 MODEL_SINGLE_EXP = "Option 2:  Q(t) = C + A·exp(−k·t)"
+
+# Time-frame alignment modes for the current-vs-time overlay.
+ALIGN_SHIFT = "Shift each point to the reference start time"
+ALIGN_INDEX = "Use the reference point's time samples (index-wise)"
+ALIGN_RAW = "No alignment (each point's own time)"
 
 # ----------------------------------------------------------------------------
 # Helpers
@@ -138,7 +144,6 @@ def trapz_signed(xvar, current, baseline):
 
 # ----------------------------------------------------------------------------
 # Exponential decay fit:  I(t) = C + A*exp(-k*t)
-# t measured from the first (used) peak; this leaves C and k unchanged.
 # ----------------------------------------------------------------------------
 
 def exp_model(t, C, A, k):
@@ -169,8 +174,7 @@ def fit_exp_decay(t, y):
 
 
 def peak_time_series(work, skip_first=False):
-    """Per-scan peak times & peak currents for anode & cathode, ordered by scan.
-    If skip_first, the first scan (scan 1) is excluded."""
+    """Per-scan peak times & peak currents for anode & cathode, ordered by scan."""
     scans = sorted_scans(work)
     if skip_first and len(scans) > 1:
         scans = scans[1:]
@@ -901,7 +905,7 @@ st.title("Cyclic Voltammetry — Charge Integration (multi-file)")
 st.caption(
     "Upload several Excel files (name them 'point 1' … 'point 10'). View each "
     "file's full analysis from the dropdown; overlay current vs time across "
-    "points; see the point-wise comparison below."
+    "points on a common time frame; see the point-wise comparison below."
 )
 
 with st.sidebar:
@@ -962,7 +966,16 @@ with st.sidebar:
         index=0,
     )
 
-    st.header("7 · Overlay appearance")
+    st.header("7 · Overlay (current vs time)")
+    overlay_ref = st.selectbox(
+        "Reference point — supplies the common time frame",
+        file_names, index=0, format_func=point_label,
+    )
+    align_mode = st.selectbox(
+        "How to put every point on that time frame",
+        [ALIGN_SHIFT, ALIGN_INDEX, ALIGN_RAW],
+        index=0,
+    )
     overlay_width = st.slider("Overlay line thickness", 0.2, 2.0, 0.7, 0.1)
 
 
@@ -992,15 +1005,16 @@ else:
     analyse_file(work, pot_col, cur_col, view_key, skip_first)
 
 # ----------------------------------------------------------------------------
-# Overlay: current vs time across selected points
+# Overlay: current vs time on the reference point's time frame
 # ----------------------------------------------------------------------------
 
 st.markdown("---")
-st.header("Overlay — current vs time")
+st.header("Overlay — current vs time (common time frame)")
 st.caption(
-    "Tick the points to include. Each point is drawn as a single thin line in one "
-    "colour (all of its scans joined in time order); the legend names the point. "
-    "All scans are included here regardless of the scan-1 setting."
+    f"Every ticked point is plotted on the time frame of **{point_label(overlay_ref)}** "
+    "so the cycles line up. Each point is one thin line in one colour, all its "
+    "scans joined in time order, named in the legend. The reference point only "
+    "supplies the time axis — tick it if you also want its curve drawn."
 )
 
 # Fixed colour per point, so a point keeps its colour whatever the selection is.
@@ -1026,28 +1040,67 @@ for i, name in enumerate(file_names):
     if checked:
         selected_overlay.append(name)
 
-if not selected_overlay:
+# The reference point's own time vector defines the common frame.
+ref_work = prepare(file_by_name[overlay_ref])
+ref_t = None
+if ref_work is not None and not ref_work.empty:
+    ref_t = ref_work.sort_values("time")["time"].to_numpy(dtype=float)
+
+if ref_t is None or len(ref_t) == 0:
+    st.error(f"Reference point '{point_label(overlay_ref)}' has no usable data — "
+             "pick a different reference in the sidebar.")
+elif not selected_overlay:
     st.info("Tick at least one point to build the overlay.")
 else:
+    t0_ref = float(ref_t[0])
     ofig = go.Figure()
+    length_notes = []
     for name in selected_overlay:
         w = prepare(file_by_name[name])
         if w is None or w.empty:
             continue
         wt = w.sort_values("time")
+        t_vals = wt["time"].to_numpy(dtype=float)
+        i_vals = wt["current"].to_numpy(dtype=float)
         label = point_label(name)
+
+        if align_mode == ALIGN_SHIFT:
+            # Rigid shift: each point starts where the reference starts, so its
+            # own sampling/duration is preserved but the cycles line up.
+            x_vals = t_vals - t_vals[0] + t0_ref
+            y_vals = i_vals
+        elif align_mode == ALIGN_INDEX:
+            # Sample-for-sample remap onto the reference's own time values.
+            n = min(len(ref_t), len(i_vals))
+            if len(i_vals) != len(ref_t):
+                length_notes.append(f"{label}: {len(i_vals)} rows vs "
+                                    f"reference {len(ref_t)}")
+            x_vals = ref_t[:n]
+            y_vals = i_vals[:n]
+        else:  # ALIGN_RAW
+            x_vals = t_vals
+            y_vals = i_vals
+
         ofig.add_trace(go.Scatter(
-            x=wt["time"], y=wt["current"], mode="lines", name=label,
+            x=x_vals, y=y_vals, mode="lines", name=label,
             line=dict(color=overlay_colors[name], width=overlay_width),
             hovertemplate=label + "<br>t=%{x:.1f} s<br>I=%{y:.3e} A<extra></extra>",
         ))
+
+    if align_mode == ALIGN_RAW:
+        x_title = f"{time_col}"
+    else:
+        x_title = f"{time_col} — time frame of {point_label(overlay_ref)}"
     ofig.update_layout(
-        xaxis_title=time_col, yaxis_title=cur_col, height=580,
+        xaxis_title=x_title, yaxis_title=cur_col, height=580,
         margin=dict(l=70, r=20, t=30, b=50), template="plotly_white",
         hovermode="closest",
         legend=dict(title="Point", itemsizing="constant"),
     )
     st.plotly_chart(ofig, use_container_width=True, key="overlay_current_time")
+    if length_notes:
+        st.caption("Row-count mismatch — curves truncated to the shorter length: "
+                   + "; ".join(length_notes))
 
 # ----------------------------------------------------------------------------
 # Point-wise comparison across all files
